@@ -1,0 +1,80 @@
+{
+    "swagger": "2.0",
+    "info": {
+        "contact": {}
+    },
+    "paths": {
+        "/loan-application": {
+            "post": {
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "loan-origination"
+                ],
+                "summary": "Create New Loan APplication",
+                "operationId": "create-loan-application",
+                "parameters": [
+                    {
+                        "description": "Loan Application ",
+                        "name": "loanApplicationRequest",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/dto.LoanApplicationInputStep"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/common.HTTPError"
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "definitions": {
+        "common.HTTPError": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "integer",
+                    "example": 400
+                },
+                "message": {
+                    "type": "string",
+                    "example": "status bad request"
+                }
+            }
+        },
+        "dto.LoanApplicationInputStep": {
+            "type": "object",
+            "properties": {
+                "aadhaar_number": {
+                    "type": "string"
+                },
+                "applicant_name": {
+                    "type": "string"
+                },
+                "application_no": {
+                    "type": "string"
+                },
+                "pan_number": {
+                    "type": "string"
+                }
+            }
+        }
+    }
+}

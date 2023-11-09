@@ -1,0 +1,51 @@
+definitions:
+  common.HTTPError:
+    properties:
+      code:
+        example: 400
+        type: integer
+      message:
+        example: status bad request
+        type: string
+    type: object
+  dto.LoanApplicationInputStep:
+    properties:
+      aadhaar_number:
+        type: string
+      applicant_name:
+        type: string
+      application_no:
+        type: string
+      pan_number:
+        type: string
+    type: object
+info:
+  contact: {}
+paths:
+  /loan-application:
+    post:
+      consumes:
+      - application/json
+      operationId: create-loan-application
+      parameters:
+      - description: 'Loan Application '
+        in: body
+        name: loanApplicationRequest
+        required: true
+        schema:
+          $ref: '#/definitions/dto.LoanApplicationInputStep'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            type: string
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/common.HTTPError'
+      summary: Create New Loan APplication
+      tags:
+      - loan-origination
+swagger: "2.0"
