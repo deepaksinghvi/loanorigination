@@ -8,7 +8,21 @@ const (
 	TaskListName   = "lo-loan_worker"
 	ClientName     = "lo-loan_worker"
 	CadenceService = "cadence-frontend"
+
+	QueryNameLoWorkflowState = "lo-workflow-state"
+
+	Initialized State = "initialized"
+	Submitted   State = "submitted"
+	Approved    State = "approved"
+	Rejected    State = "rejected"
+	Closed      State = "closed"
 )
+
+type State string
+type QueryResult struct {
+	State   State
+	Content string
+}
 
 type HTTPError struct {
 	Code    int    `json:"code" example:"400"`

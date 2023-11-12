@@ -1,4 +1,4 @@
-// Copyright (c) 2020 Uber Technologies, Inc.
+// Copyright (c) 2021 Uber Technologies, Inc.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -20,26 +20,12 @@
 
 package tally
 
-import (
-	"bytes"
-	"sort"
-)
-
 const (
 	prefixSplitter  = '+'
 	keyPairSplitter = ','
 	keyNameSplitter = '='
+	nilString       = ""
 )
-
-var (
-	keyGenPool = newKeyGenerationPool(1024, 1024, 32)
-	nilString  = ""
-)
-
-type keyGenerationPool struct {
-	bufferPool  *ObjectPool
-	stringsPool *ObjectPool
-}
 
 // KeyForStringMap generates a unique key for a map string set combination.
 func KeyForStringMap(
@@ -54,58 +40,67 @@ func KeyForPrefixedStringMap(
 	prefix string,
 	stringMap map[string]string,
 ) string {
-	keys := keyGenPool.stringsPool.Get().([]string)
-	for k := range stringMap {
-		keys = append(keys, k)
-	}
-
-	sort.Strings(keys)
-
-	buf := keyGenPool.bufferPool.Get().(*bytes.Buffer)
-
-	if prefix != nilString {
-		buf.WriteString(prefix)
-		buf.WriteByte(prefixSplitter)
-	}
-
-	sortedKeysLen := len(stringMap)
-	for i := 0; i < sortedKeysLen; i++ {
-		buf.WriteString(keys[i])
-		buf.WriteByte(keyNameSplitter)
-		buf.WriteString(stringMap[keys[i]])
-		if i != sortedKeysLen-1 {
-			buf.WriteByte(keyPairSplitter)
+	return keyForPrefixedStringMaps(prefix, stringMap)
+}
+// keyForPrefixedStringMapsAsKey writes a key using the prefix and the tags in a canonical form to
+// the given input byte slice and returns a reference to the byte slice. Callers of this method can
+// use a stack allocated byte slice to remove heap allocation.
+func keyForPrefixedStringMapsAsKey(buf []byte, prefix string, maps ...map[string]string) []byte {
+	// stack allocated
+	keys := make([]string, 0, 32)
+	for _, m := range maps {
+		for k := range m {
+			keys = append(keys, k)
 		}
 	}
 
-	key := buf.String()
-	keyGenPool.release(buf, keys)
-	return key
+	insertionSort(keys)
+
+	if prefix != nilString {
+		buf = append(buf, prefix...)
+		buf = append(buf, prefixSplitter)
+	}
+
+	var lastKey string // last key written to the buffer
+	for _, k := range keys {
+		if len(lastKey) > 0 {
+			if k == lastKey {
+				// Already wrote this key.
+				continue
+			}
+			buf = append(buf, keyPairSplitter)
+		}
+		lastKey = k
+
+		buf = append(buf, k...)
+		buf = append(buf, keyNameSplitter)
+
+		// Find and write the value for this key. Rightmost map takes
+		// precedence.
+		for j := len(maps) - 1; j >= 0; j-- {
+			if v, ok := maps[j][k]; ok {
+				buf = append(buf, v...)
+				break
+			}
+		}
+	}
+
+	return buf
 }
 
-func newKeyGenerationPool(size, blen, slen int) *keyGenerationPool {
-	b := NewObjectPool(size)
-	b.Init(func() interface{} {
-		return bytes.NewBuffer(make([]byte, 0, blen))
-	})
-
-	s := NewObjectPool(size)
-	s.Init(func() interface{} {
-		return make([]string, 0, slen)
-	})
-
-	return &keyGenerationPool{
-		bufferPool:  b,
-		stringsPool: s,
-	}
+// keyForPrefixedStringMaps generates a unique key for a prefix and a series
+// of maps containing tags.
+//
+// If a key occurs in multiple maps, keys on the right take precedence.
+func keyForPrefixedStringMaps(prefix string, maps ...map[string]string) string {
+	return string(keyForPrefixedStringMapsAsKey(make([]byte, 0, 256), prefix, maps...))
 }
 
-func (s *keyGenerationPool) release(b *bytes.Buffer, strs []string) {
-	b.Reset()
-	s.bufferPool.Put(b)
-
-	for i := range strs {
-		strs[i] = nilString
+func insertionSort(keys []string) {
+	n := len(keys)
+	for i := 1; i < n; i++ {
+		for j := i; j > 0 && keys[j] < keys[j-1]; j-- {
+			keys[j], keys[j-1] = keys[j-1], keys[j]
+		}
 	}
-	s.stringsPool.Put(strs[:0])
 }

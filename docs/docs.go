@@ -54,6 +54,51 @@ const docTemplate = `{
                     }
                 }
             }
+        },
+        "/loan-application/{workflow_id}/{run_id}": {
+            "get": {
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "loan-origination"
+                ],
+                "summary": "GetLoan Application state",
+                "operationId": "get-loan-application",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Workflow ID",
+                        "name": "workflow_id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Run ID",
+                        "name": "run_id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/common.QueryResult"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/common.HTTPError"
+                        }
+                    }
+                }
+            }
         }
     },
     "definitions": {
@@ -70,6 +115,34 @@ const docTemplate = `{
                 }
             }
         },
+        "common.QueryResult": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string"
+                },
+                "state": {
+                    "$ref": "#/definitions/common.State"
+                }
+            }
+        },
+        "common.State": {
+            "type": "string",
+            "enum": [
+                "initialized",
+                "submitted",
+                "approved",
+                "rejected",
+                "closed"
+            ],
+            "x-enum-varnames": [
+                "Initialized",
+                "Submitted",
+                "Approved",
+                "Rejected",
+                "Closed"
+            ]
+        },
         "dto.LoanApplicationInputStep": {
             "type": "object",
             "properties": {
@@ -77,9 +150,7 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "applicant_name": {
-                    "type": "string"
-                },
-                "application_no": {
+                    "description": "ApplicationNo string ` + "`" + `json:\"application_no\"` + "`" + `",
                     "type": "string"
                 },
                 "pan_number": {

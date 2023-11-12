@@ -1,4 +1,4 @@
-// Copyright (c) 2020 Uber Technologies, Inc.
+// Copyright (c) 2021 Uber Technologies, Inc.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -35,6 +35,13 @@ var (
 	errBucketsCountNeedsGreaterThanZero = errors.New("n needs to be > 0")
 	errBucketsStartNeedsGreaterThanZero = errors.New("start needs to be > 0")
 	errBucketsFactorNeedsGreaterThanOne = errors.New("factor needs to be > 1")
+
+	_singleBucket = bucketPair{
+		lowerBoundDuration: time.Duration(math.MinInt64),
+		upperBoundDuration: time.Duration(math.MaxInt64),
+		lowerBoundValue:    -math.MaxFloat64,
+		upperBoundValue:    math.MaxFloat64,
+	}
 )
 
 // ValueBuckets is a set of float64 values that implements Buckets.
@@ -65,7 +72,7 @@ func (v ValueBuckets) String() string {
 
 // AsValues implements Buckets.
 func (v ValueBuckets) AsValues() []float64 {
-	return []float64(v)
+	return v
 }
 
 // AsDurations implements Buckets and returns time.Duration
@@ -116,76 +123,135 @@ func (v DurationBuckets) AsValues() []float64 {
 
 // AsDurations implements Buckets.
 func (v DurationBuckets) AsDurations() []time.Duration {
-	return []time.Duration(v)
+	return v
+}
+
+func bucketsEqual(x Buckets, y Buckets) bool {
+	switch b1 := x.(type) {
+	case DurationBuckets:
+		b2, ok := y.(DurationBuckets)
+		if !ok {
+			return false
+		}
+		if len(b1) != len(b2) {
+			return false
+		}
+		for i := 0; i < len(b1); i++ {
+			if b1[i] != b2[i] {
+				return false
+			}
+		}
+	case ValueBuckets:
+		b2, ok := y.(ValueBuckets)
+		if !ok {
+			return false
+		}
+		if len(b1) != len(b2) {
+			return false
+		}
+		for i := 0; i < len(b1); i++ {
+			if b1[i] != b2[i] {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+func newBucketPair(
+	htype histogramType,
+	durations []time.Duration,
+	values []float64,
+	upperBoundIndex int,
+	prev BucketPair,
+) bucketPair {
+	var pair bucketPair
+
+	switch htype {
+	case durationHistogramType:
+		pair = bucketPair{
+			lowerBoundDuration: prev.UpperBoundDuration(),
+			upperBoundDuration: durations[upperBoundIndex],
+		}
+	case valueHistogramType:
+		pair = bucketPair{
+			lowerBoundValue: prev.UpperBoundValue(),
+			upperBoundValue: values[upperBoundIndex],
+		}
+	default:
+		// nop
+	}
+
+	return pair
 }
 
 // BucketPairs creates a set of bucket pairs from a set
 // of buckets describing the lower and upper bounds for
 // each derived bucket.
 func BucketPairs(buckets Buckets) []BucketPair {
-	if buckets == nil || buckets.Len() < 1 {
-		return []BucketPair{
+	htype := valueHistogramType
+	if _, ok := buckets.(DurationBuckets); ok {
+		htype = durationHistogramType
+	}
 
-			bucketPair{
-				lowerBoundValue:    -math.MaxFloat64,
-				upperBoundValue:    math.MaxFloat64,
-				lowerBoundDuration: time.Duration(math.MinInt64),
-				upperBoundDuration: time.Duration(math.MaxInt64),
-			},
-		}
+	if buckets == nil || buckets.Len() < 1 {
+		return []BucketPair{_singleBucket}
 	}
 
 	var (
-		asValueBuckets    = copyAndSortValues(buckets.AsValues())
-		asDurationBuckets = copyAndSortDurations(buckets.AsDurations())
-		pairs             = make([]BucketPair, 0, buckets.Len()+2)
+		values    []float64
+		durations []time.Duration
+		pairs     = make([]BucketPair, 0, buckets.Len()+2)
+		pair      bucketPair
 	)
 
-	pairs = append(pairs, bucketPair{
-		lowerBoundValue:    -math.MaxFloat64,
-		upperBoundValue:    asValueBuckets[0],
-		lowerBoundDuration: time.Duration(math.MinInt64),
-		upperBoundDuration: asDurationBuckets[0],
-	})
-
-	prevValueBucket, prevDurationBucket :=
-		asValueBuckets[0], asDurationBuckets[0]
-
-	for i := 1; i < buckets.Len(); i++ {
-		pairs = append(pairs, bucketPair{
-			lowerBoundValue:    prevValueBucket,
-			upperBoundValue:    asValueBuckets[i],
-			lowerBoundDuration: prevDurationBucket,
-			upperBoundDuration: asDurationBuckets[i],
-		})
-		prevValueBucket, prevDurationBucket =
-			asValueBuckets[i], asDurationBuckets[i]
+	switch htype {
+	case durationHistogramType:
+		durations = copyAndSortDurations(buckets.AsDurations())
+		pair.lowerBoundDuration = _singleBucket.lowerBoundDuration
+		pair.upperBoundDuration = durations[0]
+	case valueHistogramType:
+		values = copyAndSortValues(buckets.AsValues())
+		pair.lowerBoundValue = _singleBucket.lowerBoundValue
+		pair.upperBoundValue = values[0]
+	default:
+		// n.b. This branch will never be executed because htype is only ever
+		//      one of two values.
+		panic("unsupported histogram type")
 	}
 
-	pairs = append(pairs, bucketPair{
-		lowerBoundValue:    prevValueBucket,
-		upperBoundValue:    math.MaxFloat64,
-		lowerBoundDuration: prevDurationBucket,
-		upperBoundDuration: time.Duration(math.MaxInt64),
-	})
+	pairs = append(pairs, pair)
+	for i := 1; i < buckets.Len(); i++ {
+		pairs = append(
+			pairs,
+			newBucketPair(htype, durations, values, i, pairs[i-1]),
+		)
+	}
+
+	switch htype {
+	case durationHistogramType:
+		pair.lowerBoundDuration = pairs[len(pairs)-1].UpperBoundDuration()
+		pair.upperBoundDuration = _singleBucket.upperBoundDuration
+	case valueHistogramType:
+		pair.lowerBoundValue = pairs[len(pairs)-1].UpperBoundValue()
+		pair.upperBoundValue = _singleBucket.upperBoundValue
+	}
+	pairs = append(pairs, pair)
 
 	return pairs
 }
 
 func copyAndSortValues(values []float64) []float64 {
 	valuesCopy := make([]float64, len(values))
-	for i := range values {
-		valuesCopy[i] = values[i]
-	}
+	copy(valuesCopy, values)
 	sort.Sort(ValueBuckets(valuesCopy))
 	return valuesCopy
 }
 
 func copyAndSortDurations(durations []time.Duration) []time.Duration {
 	durationsCopy := make([]time.Duration, len(durations))
-	for i := range durations {
-		durationsCopy[i] = durations[i]
-	}
+	copy(durationsCopy, durations)
 	sort.Sort(DurationBuckets(durationsCopy))
 	return durationsCopy
 }
@@ -222,7 +288,7 @@ func LinearValueBuckets(start, width float64, n int) (ValueBuckets, error) {
 	for i := range buckets {
 		buckets[i] = start + (float64(i) * width)
 	}
-	return ValueBuckets(buckets), nil
+	return buckets, nil
 }
 
 // MustMakeLinearValueBuckets creates a set of linear value buckets
@@ -244,7 +310,7 @@ func LinearDurationBuckets(start, width time.Duration, n int) (DurationBuckets, 
 	for i := range buckets {
 		buckets[i] = start + (time.Duration(i) * width)
 	}
-	return DurationBuckets(buckets), nil
+	return buckets, nil
 }
 
 // MustMakeLinearDurationBuckets creates a set of linear duration buckets.
@@ -274,7 +340,7 @@ func ExponentialValueBuckets(start, factor float64, n int) (ValueBuckets, error)
 		buckets[i] = curr
 		curr *= factor
 	}
-	return ValueBuckets(buckets), nil
+	return buckets, nil
 }
 
 // MustMakeExponentialValueBuckets creates a set of exponential value buckets
@@ -304,7 +370,7 @@ func ExponentialDurationBuckets(start time.Duration, factor float64, n int) (Dur
 		buckets[i] = curr
 		curr = time.Duration(float64(curr) * factor)
 	}
-	return DurationBuckets(buckets), nil
+	return buckets, nil
 }
 
 // MustMakeExponentialDurationBuckets creates a set of exponential value buckets

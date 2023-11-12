@@ -1,4 +1,4 @@
-// Copyright (c) 2020 Uber Technologies, Inc.
+// Copyright (c) 2021 Uber Technologies, Inc.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -21,11 +21,14 @@
 package tally
 
 import (
+	"fmt"
 	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/uber-go/tally/internal/identity"
 )
 
 var (
@@ -232,7 +235,7 @@ func (r *timerNoReporterSink) ReportHistogramValueSamples(
 	name string,
 	tags map[string]string,
 	buckets Buckets,
-	bucketLowerBound,
+	bucketLowerBound float64,
 	bucketUpperBound float64,
 	samples int64,
 ) {
@@ -242,7 +245,7 @@ func (r *timerNoReporterSink) ReportHistogramDurationSamples(
 	name string,
 	tags map[string]string,
 	buckets Buckets,
-	bucketLowerBound,
+	bucketLowerBound time.Duration,
 	bucketUpperBound time.Duration,
 	samples int64,
 ) {
@@ -255,15 +258,19 @@ func (r *timerNoReporterSink) Capabilities() Capabilities {
 func (r *timerNoReporterSink) Flush() {
 }
 
+type sampleCounter struct {
+	counter      *counter
+	cachedBucket CachedHistogramBucket
+}
+
 type histogram struct {
-	htype            histogramType
-	name             string
-	tags             map[string]string
-	reporter         StatsReporter
-	specification    Buckets
-	buckets          []histogramBucket
-	lookupByValue    []float64
-	lookupByDuration []int
+	htype         histogramType
+	name          string
+	tags          map[string]string
+	reporter      StatsReporter
+	specification Buckets
+	buckets       []histogramBucket
+	samples       []sampleCounter
 }
 
 type histogramType int
@@ -274,96 +281,119 @@ const (
 )
 
 func newHistogram(
+	htype histogramType,
 	name string,
 	tags map[string]string,
 	reporter StatsReporter,
-	buckets Buckets,
+	storage bucketStorage,
 	cachedHistogram CachedHistogram,
 ) *histogram {
-	htype := valueHistogramType
-	if _, ok := buckets.(DurationBuckets); ok {
-		htype = durationHistogramType
-	}
-
-	pairs := BucketPairs(buckets)
-
 	h := &histogram{
-		htype:            htype,
-		name:             name,
-		tags:             tags,
-		reporter:         reporter,
-		specification:    buckets,
-		buckets:          make([]histogramBucket, 0, len(pairs)),
-		lookupByValue:    make([]float64, 0, len(pairs)),
-		lookupByDuration: make([]int, 0, len(pairs)),
+		htype:         htype,
+		name:          name,
+		tags:          tags,
+		reporter:      reporter,
+		specification: storage.buckets,
+		buckets:       storage.hbuckets,
+		samples:       make([]sampleCounter, len(storage.hbuckets)),
 	}
 
-	for _, pair := range pairs {
-		h.addBucket(newHistogramBucket(h,
-			pair.LowerBoundValue(), pair.UpperBoundValue(),
-			pair.LowerBoundDuration(), pair.UpperBoundDuration(),
-			cachedHistogram))
+	for i := range h.samples {
+		h.samples[i].counter = newCounter(nil)
+
+		if cachedHistogram != nil {
+			switch htype {
+			case durationHistogramType:
+				h.samples[i].cachedBucket = cachedHistogram.DurationBucket(
+					durationLowerBound(storage.hbuckets, i),
+					storage.hbuckets[i].durationUpperBound,
+				)
+			case valueHistogramType:
+				h.samples[i].cachedBucket = cachedHistogram.ValueBucket(
+					valueLowerBound(storage.hbuckets, i),
+					storage.hbuckets[i].valueUpperBound,
+				)
+			}
+		}
 	}
 
 	return h
 }
 
-func (h *histogram) addBucket(b histogramBucket) {
-	h.buckets = append(h.buckets, b)
-	h.lookupByValue = append(h.lookupByValue, b.valueUpperBound)
-	h.lookupByDuration = append(h.lookupByDuration, int(b.durationUpperBound))
-}
-
 func (h *histogram) report(name string, tags map[string]string, r StatsReporter) {
 	for i := range h.buckets {
-		samples := h.buckets[i].samples.value()
+		samples := h.samples[i].counter.value()
 		if samples == 0 {
 			continue
 		}
+
 		switch h.htype {
 		case valueHistogramType:
-			r.ReportHistogramValueSamples(name, tags, h.specification,
-				h.buckets[i].valueLowerBound, h.buckets[i].valueUpperBound,
-				samples)
+			r.ReportHistogramValueSamples(
+				name,
+				tags,
+				h.specification,
+				valueLowerBound(h.buckets, i),
+				h.buckets[i].valueUpperBound,
+				samples,
+			)
 		case durationHistogramType:
-			r.ReportHistogramDurationSamples(name, tags, h.specification,
-				h.buckets[i].durationLowerBound, h.buckets[i].durationUpperBound,
-				samples)
+			r.ReportHistogramDurationSamples(
+				name,
+				tags,
+				h.specification,
+				durationLowerBound(h.buckets, i),
+				h.buckets[i].durationUpperBound,
+				samples,
+			)
 		}
 	}
 }
 
 func (h *histogram) cachedReport() {
 	for i := range h.buckets {
-		samples := h.buckets[i].samples.value()
+		samples := h.samples[i].counter.value()
 		if samples == 0 {
 			continue
 		}
+
 		switch h.htype {
 		case valueHistogramType:
-			h.buckets[i].cachedValueBucket.ReportSamples(samples)
+			h.samples[i].cachedBucket.ReportSamples(samples)
 		case durationHistogramType:
-			h.buckets[i].cachedDurationBucket.ReportSamples(samples)
+			h.samples[i].cachedBucket.ReportSamples(samples)
 		}
 	}
 }
 
 func (h *histogram) RecordValue(value float64) {
+	if h.htype != valueHistogramType {
+		return
+	}
+
 	// Find the highest inclusive of the bucket upper bound
 	// and emit directly to it. Since we use BucketPairs to derive
 	// buckets there will always be an inclusive bucket as
 	// we always have a math.MaxFloat64 bucket.
-	idx := sort.SearchFloat64s(h.lookupByValue, value)
-	h.buckets[idx].samples.Inc(1)
+	idx := sort.Search(len(h.buckets), func(i int) bool {
+		return h.buckets[i].valueUpperBound >= value
+	})
+	h.samples[idx].counter.Inc(1)
 }
 
 func (h *histogram) RecordDuration(value time.Duration) {
+	if h.htype != durationHistogramType {
+		return
+	}
+
 	// Find the highest inclusive of the bucket upper bound
 	// and emit directly to it. Since we use BucketPairs to derive
 	// buckets there will always be an inclusive bucket as
 	// we always have a math.MaxInt64 bucket.
-	idx := sort.SearchInts(h.lookupByDuration, int(value))
-	h.buckets[idx].samples.Inc(1)
+	idx := sort.Search(len(h.buckets), func(i int) bool {
+		return h.buckets[i].durationUpperBound >= value
+	})
+	h.samples[idx].counter.Inc(1)
 }
 
 func (h *histogram) Start() Stopwatch {
@@ -376,66 +406,112 @@ func (h *histogram) RecordStopwatch(stopwatchStart time.Time) {
 }
 
 func (h *histogram) snapshotValues() map[float64]int64 {
-	if h.htype == durationHistogramType {
+	if h.htype != valueHistogramType {
 		return nil
 	}
 
 	vals := make(map[float64]int64, len(h.buckets))
 	for i := range h.buckets {
-		vals[h.buckets[i].valueUpperBound] = h.buckets[i].samples.value()
+		vals[h.buckets[i].valueUpperBound] = h.samples[i].counter.snapshot()
 	}
 
 	return vals
 }
 
 func (h *histogram) snapshotDurations() map[time.Duration]int64 {
-	if h.htype == valueHistogramType {
+	if h.htype != durationHistogramType {
 		return nil
 	}
 
 	durations := make(map[time.Duration]int64, len(h.buckets))
 	for i := range h.buckets {
-		durations[h.buckets[i].durationUpperBound] = h.buckets[i].samples.value()
+		durations[h.buckets[i].durationUpperBound] = h.samples[i].counter.snapshot()
 	}
 
 	return durations
 }
 
 type histogramBucket struct {
-	h                    *histogram
-	samples              *counter
-	valueLowerBound      float64
 	valueUpperBound      float64
-	durationLowerBound   time.Duration
 	durationUpperBound   time.Duration
 	cachedValueBucket    CachedHistogramBucket
 	cachedDurationBucket CachedHistogramBucket
 }
 
-func newHistogramBucket(
-	h *histogram,
-	valueLowerBound,
-	valueUpperBound float64,
-	durationLowerBound,
-	durationUpperBound time.Duration,
-	cachedHistogram CachedHistogram,
-) histogramBucket {
-	bucket := histogramBucket{
-		samples:            newCounter(nil),
-		valueLowerBound:    valueLowerBound,
-		valueUpperBound:    valueUpperBound,
-		durationLowerBound: durationLowerBound,
-		durationUpperBound: durationUpperBound,
+func durationLowerBound(buckets []histogramBucket, i int) time.Duration {
+	if i <= 0 {
+		return time.Duration(math.MinInt64)
 	}
-	if cachedHistogram != nil {
-		bucket.cachedValueBucket = cachedHistogram.ValueBucket(
-			bucket.valueLowerBound, bucket.valueUpperBound,
-		)
-		bucket.cachedDurationBucket = cachedHistogram.DurationBucket(
-			bucket.durationLowerBound, bucket.durationUpperBound,
-		)
+	return buckets[i-1].durationUpperBound
+}
+
+func valueLowerBound(buckets []histogramBucket, i int) float64 {
+	if i <= 0 {
+		return -math.MaxFloat64
 	}
-	return bucket
+	return buckets[i-1].valueUpperBound
+}
+
+type bucketStorage struct {
+	buckets  Buckets
+	hbuckets []histogramBucket
+}
+
+func newBucketStorage(
+	htype histogramType,
+	buckets Buckets,
+) bucketStorage {
+	var (
+		pairs   = BucketPairs(buckets)
+		storage = bucketStorage{
+			buckets:  buckets,
+			hbuckets: make([]histogramBucket, 0, len(pairs)),
+		}
+	)
+
+	for _, pair := range pairs {
+		storage.hbuckets = append(storage.hbuckets, histogramBucket{
+			valueUpperBound:    pair.UpperBoundValue(),
+			durationUpperBound: pair.UpperBoundDuration(),
+		})
+	}
+
+	return storage
+}
+
+type bucketCache struct {
+	mtx   sync.RWMutex
+	cache map[uint64]bucketStorage
+}
+
+func newBucketCache() *bucketCache {
+	return &bucketCache{
+		cache: make(map[uint64]bucketStorage),
+	}
+}
+
+func (c *bucketCache) Get(
+	htype histogramType,
+	buckets Buckets,
+) bucketStorage {
+	id := getBucketsIdentity(buckets)
+
+	c.mtx.RLock()
+	storage, ok := c.cache[id]
+	if !ok {
+		c.mtx.RUnlock()
+		c.mtx.Lock()
+		storage = newBucketStorage(htype, buckets)
+		c.cache[id] = storage
+		c.mtx.Unlock()
+	} else {
+		c.mtx.RUnlock()
+		if !bucketsEqual(buckets, storage.buckets) {
+			storage = newBucketStorage(htype, buckets)
+		}
+	}
+
+	return storage
 }
 
 // NullStatsReporter is an implementation of StatsReporter than simply does nothing.
@@ -473,3 +549,14 @@ func (r nullStatsReporter) Flush() {
 }
 
 type nullStatsReporter struct{}
+
+func getBucketsIdentity(buckets Buckets) uint64 {
+	switch b := buckets.(type) {
+	case DurationBuckets:
+		return identity.Durations(b.AsDurations())
+	case ValueBuckets:
+		return identity.Float64s(b.AsValues())
+	default:
+		panic(fmt.Sprintf("unexpected bucket type: %T", b))
+	}
+}

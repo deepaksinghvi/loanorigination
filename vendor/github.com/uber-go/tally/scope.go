@@ -1,4 +1,4 @@
-// Copyright (c) 2020 Uber Technologies, Inc.
+// Copyright (c) 2023 Uber Technologies, Inc.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -24,10 +24,23 @@ import (
 	"io"
 	"sync"
 	"time"
+
+	"go.uber.org/atomic"
 )
 
+// InternalMetricOption is used to configure internal metrics.
+type InternalMetricOption int
+
 const (
-	_defaultInitialSliceSize = 16
+	// Unset is the "no-op" config, which turns off internal metrics.
+	Unset InternalMetricOption = iota
+	// SendInternalMetrics turns on internal metrics submission.
+	SendInternalMetrics
+	// OmitInternalMetrics turns off internal metrics submission.
+	OmitInternalMetrics
+
+	_defaultInitialSliceSize  = 16
+	_defaultReportingInterval = 2 * time.Second
 )
 
 var (
@@ -68,7 +81,6 @@ type scope struct {
 	sanitizer      Sanitizer
 
 	registry *scopeRegistry
-	status   scopeStatus
 
 	cm sync.RWMutex
 	gm sync.RWMutex
@@ -84,20 +96,14 @@ type scope struct {
 	timers          map[string]*timer
 	// nb: deliberately skipping timersSlice as we report timers immediately,
 	// no buffering is involved.
-}
 
-type scopeStatus struct {
-	sync.RWMutex
-	closed bool
-	quit   chan struct{}
+	bucketCache *bucketCache
+	closed      atomic.Bool
+	done        chan struct{}
+	wg          sync.WaitGroup
+	root        bool
+	testScope   bool
 }
-
-type scopeRegistry struct {
-	sync.RWMutex
-	subscopes map[string]*scope
-}
-
-var scopeRegistryKey = KeyForPrefixedStringMap
 
 // ScopeOptions is a set of options to construct a scope.
 type ScopeOptions struct {
@@ -108,6 +114,10 @@ type ScopeOptions struct {
 	Separator       string
 	DefaultBuckets  Buckets
 	SanitizeOptions *SanitizeOptions
+	MetricsOption   InternalMetricOption
+
+	testScope          bool
+	registryShardCount uint
 }
 
 // NewRootScope creates a new root Scope with a set of options and
@@ -118,6 +128,12 @@ func NewRootScope(opts ScopeOptions, interval time.Duration) (Scope, io.Closer) 
 	return s, s
 }
 
+// NewRootScopeWithDefaultInterval invokes NewRootScope with the default
+// reporting interval of 2s.
+func NewRootScopeWithDefaultInterval(opts ScopeOptions) (Scope, io.Closer) {
+	return NewRootScope(opts, _defaultReportingInterval)
+}
+
 // NewTestScope creates a new Scope without a stats reporter with the
 // given prefix and adds the ability to take snapshots of metrics emitted
 // to it.
@@ -125,7 +141,11 @@ func NewTestScope(
 	prefix string,
 	tags map[string]string,
 ) TestScope {
-	return newRootScope(ScopeOptions{Prefix: prefix, Tags: tags}, 0)
+	return newRootScope(ScopeOptions{
+		Prefix:    prefix,
+		Tags:      tags,
+		testScope: true,
+	}, 0)
 }
 
 func newRootScope(opts ScopeOptions, interval time.Duration) *scope {
@@ -153,29 +173,24 @@ func newRootScope(opts ScopeOptions, interval time.Duration) *scope {
 	}
 
 	s := &scope{
-		separator:      sanitizer.Name(opts.Separator),
-		prefix:         sanitizer.Name(opts.Prefix),
-		reporter:       opts.Reporter,
-		cachedReporter: opts.CachedReporter,
-		baseReporter:   baseReporter,
-		defaultBuckets: opts.DefaultBuckets,
-		sanitizer:      sanitizer,
-
-		registry: &scopeRegistry{
-			subscopes: make(map[string]*scope),
-		},
-		status: scopeStatus{
-			closed: false,
-			quit:   make(chan struct{}, 1),
-		},
-
+		baseReporter:    baseReporter,
+		bucketCache:     newBucketCache(),
+		cachedReporter:  opts.CachedReporter,
 		counters:        make(map[string]*counter),
 		countersSlice:   make([]*counter, 0, _defaultInitialSliceSize),
+		defaultBuckets:  opts.DefaultBuckets,
+		done:            make(chan struct{}),
 		gauges:          make(map[string]*gauge),
 		gaugesSlice:     make([]*gauge, 0, _defaultInitialSliceSize),
 		histograms:      make(map[string]*histogram),
 		histogramsSlice: make([]*histogram, 0, _defaultInitialSliceSize),
+		prefix:          sanitizer.Name(opts.Prefix),
+		reporter:        opts.Reporter,
+		sanitizer:       sanitizer,
+		separator:       sanitizer.Name(opts.Separator),
 		timers:          make(map[string]*timer),
+		root:            true,
+		testScope:       opts.testScope,
 	}
 
 	// NB(r): Take a copy of the tags on creation
@@ -183,10 +198,14 @@ func newRootScope(opts ScopeOptions, interval time.Duration) *scope {
 	s.tags = s.copyAndSanitizeMap(opts.Tags)
 
 	// Register the root scope
-	s.registry.subscopes[scopeRegistryKey(s.prefix, s.tags)] = s
+	s.registry = newScopeRegistryWithShardCount(s, opts.registryShardCount, opts.MetricsOption)
 
 	if interval > 0 {
-		go s.reportLoop(interval)
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.reportLoop(interval)
+		}()
 	}
 
 	return s
@@ -246,39 +265,26 @@ func (s *scope) reportLoop(interval time.Duration) {
 		select {
 		case <-ticker.C:
 			s.reportLoopRun()
-		case <-s.status.quit:
+		case <-s.done:
 			return
 		}
 	}
 }
 
 func (s *scope) reportLoopRun() {
-	// Need to hold a status lock to ensure not to report
-	// and flush after a close
-	s.status.RLock()
-	defer s.status.RUnlock()
-
-	if s.status.closed {
+	if s.closed.Load() {
 		return
 	}
 
-	s.reportRegistryWithLock()
+	s.reportRegistry()
 }
 
-// reports current registry with scope status lock held
-func (s *scope) reportRegistryWithLock() {
-	s.registry.RLock()
-	defer s.registry.RUnlock()
-
+func (s *scope) reportRegistry() {
 	if s.reporter != nil {
-		for _, ss := range s.registry.subscopes {
-			ss.report(s.reporter)
-		}
+		s.registry.Report(s.reporter)
 		s.reporter.Flush()
 	} else if s.cachedReporter != nil {
-		for _, ss := range s.registry.subscopes {
-			ss.cachedReport()
-		}
+		s.registry.CachedReport()
 		s.cachedReporter.Flush()
 	}
 }
@@ -400,6 +406,11 @@ func (s *scope) Histogram(name string, b Buckets) Histogram {
 		b = s.defaultBuckets
 	}
 
+	htype := valueHistogramType
+	if _, ok := b.(DurationBuckets); ok {
+		htype = durationHistogramType
+	}
+
 	s.hm.Lock()
 	defer s.hm.Unlock()
 
@@ -415,7 +426,12 @@ func (s *scope) Histogram(name string, b Buckets) Histogram {
 	}
 
 	h := newHistogram(
-		s.fullyQualifiedName(name), s.tags, s.reporter, b, cachedHistogram,
+		htype,
+		s.fullyQualifiedName(name),
+		s.tags,
+		s.reporter,
+		s.bucketCache.Get(htype, b),
+		cachedHistogram,
 	)
 	s.histograms[name] = h
 	s.histogramsSlice = append(s.histogramsSlice, h)
@@ -432,7 +448,6 @@ func (s *scope) histogram(sanitizedName string) (Histogram, bool) {
 }
 
 func (s *scope) Tagged(tags map[string]string) Scope {
-	tags = s.copyAndSanitizeMap(tags)
 	return s.subscope(s.prefix, tags)
 }
 
@@ -441,53 +456,8 @@ func (s *scope) SubScope(prefix string) Scope {
 	return s.subscope(s.fullyQualifiedName(prefix), nil)
 }
 
-func (s *scope) cachedSubscope(key string) (*scope, bool) {
-	s.registry.RLock()
-	defer s.registry.RUnlock()
-
-	ss, ok := s.registry.subscopes[key]
-	return ss, ok
-}
-
-func (s *scope) subscope(prefix string, immutableTags map[string]string) Scope {
-	immutableTags = mergeRightTags(s.tags, immutableTags)
-	key := scopeRegistryKey(prefix, immutableTags)
-
-	if ss, ok := s.cachedSubscope(key); ok {
-		return ss
-	}
-
-	s.registry.Lock()
-	defer s.registry.Unlock()
-
-	if ss, ok := s.registry.subscopes[key]; ok {
-		return ss
-	}
-
-	subscope := &scope{
-		separator: s.separator,
-		prefix:    prefix,
-		// NB(prateek): don't need to copy the tags here,
-		// we assume the map provided is immutable.
-		tags:           immutableTags,
-		reporter:       s.reporter,
-		cachedReporter: s.cachedReporter,
-		baseReporter:   s.baseReporter,
-		defaultBuckets: s.defaultBuckets,
-		sanitizer:      s.sanitizer,
-		registry:       s.registry,
-
-		counters:        make(map[string]*counter),
-		countersSlice:   make([]*counter, 0, _defaultInitialSliceSize),
-		gauges:          make(map[string]*gauge),
-		gaugesSlice:     make([]*gauge, 0, _defaultInitialSliceSize),
-		histograms:      make(map[string]*histogram),
-		histogramsSlice: make([]*histogram, 0, _defaultInitialSliceSize),
-		timers:          make(map[string]*timer),
-	}
-
-	s.registry.subscopes[key] = subscope
-	return subscope
+func (s *scope) subscope(prefix string, tags map[string]string) Scope {
+	return s.registry.Subscope(s, prefix, tags)
 }
 
 func (s *scope) Capabilities() Capabilities {
@@ -500,10 +470,7 @@ func (s *scope) Capabilities() Capabilities {
 func (s *scope) Snapshot() Snapshot {
 	snap := newSnapshot()
 
-	s.registry.RLock()
-	defer s.registry.RUnlock()
-
-	for _, ss := range s.registry.subscopes {
+	s.registry.ForEachScope(func(ss *scope) {
 		// NB(r): tags are immutable, no lock required to read.
 		tags := make(map[string]string, len(s.tags))
 		for k, v := range ss.tags {
@@ -555,29 +522,58 @@ func (s *scope) Snapshot() Snapshot {
 			}
 		}
 		ss.hm.RUnlock()
-	}
+	})
 
 	return snap
 }
 
 func (s *scope) Close() error {
-	s.status.Lock()
-	defer s.status.Unlock()
-
-	// don't wait to close more than once (panic on double close of
-	// s.status.quit)
-	if s.status.closed {
+	// n.b. Once this flag is set, the next scope report will remove it from
+	//      the registry and clear its metrics.
+	if !s.closed.CAS(false, true) {
 		return nil
 	}
 
-	s.status.closed = true
-	close(s.status.quit)
-	s.reportRegistryWithLock()
+	close(s.done)
 
-	if closer, ok := s.baseReporter.(io.Closer); ok {
-		return closer.Close()
+	if s.root {
+		s.reportRegistry()
+		if closer, ok := s.baseReporter.(io.Closer); ok {
+			return closer.Close()
+		}
 	}
+
 	return nil
+}
+
+func (s *scope) clearMetrics() {
+	s.cm.Lock()
+	s.gm.Lock()
+	s.tm.Lock()
+	s.hm.Lock()
+	defer s.cm.Unlock()
+	defer s.gm.Unlock()
+	defer s.tm.Unlock()
+	defer s.hm.Unlock()
+
+	for k := range s.counters {
+		delete(s.counters, k)
+	}
+	s.countersSlice = nil
+
+	for k := range s.gauges {
+		delete(s.gauges, k)
+	}
+	s.gaugesSlice = nil
+
+	for k := range s.timers {
+		delete(s.timers, k)
+	}
+
+	for k := range s.histograms {
+		delete(s.histograms, k)
+	}
+	s.histogramsSlice = nil
 }
 
 // NB(prateek): We assume concatenation of sanitized inputs is

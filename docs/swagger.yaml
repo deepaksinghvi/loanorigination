@@ -8,13 +8,33 @@ definitions:
         example: status bad request
         type: string
     type: object
+  common.QueryResult:
+    properties:
+      content:
+        type: string
+      state:
+        $ref: '#/definitions/common.State'
+    type: object
+  common.State:
+    enum:
+    - initialized
+    - submitted
+    - approved
+    - rejected
+    - closed
+    type: string
+    x-enum-varnames:
+    - Initialized
+    - Submitted
+    - Approved
+    - Rejected
+    - Closed
   dto.LoanApplicationInputStep:
     properties:
       aadhaar_number:
         type: string
       applicant_name:
-        type: string
-      application_no:
+        description: ApplicationNo string `json:"application_no"`
         type: string
       pan_number:
         type: string
@@ -46,6 +66,36 @@ paths:
           schema:
             $ref: '#/definitions/common.HTTPError'
       summary: Create New Loan APplication
+      tags:
+      - loan-origination
+  /loan-application/{workflow_id}/{run_id}:
+    get:
+      consumes:
+      - application/json
+      operationId: get-loan-application
+      parameters:
+      - description: Workflow ID
+        in: path
+        name: workflow_id
+        required: true
+        type: string
+      - description: Run ID
+        in: path
+        name: run_id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/common.QueryResult'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/common.HTTPError'
+      summary: GetLoan Application state
       tags:
       - loan-origination
 swagger: "2.0"
